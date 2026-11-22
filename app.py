@@ -146,7 +146,7 @@ def page_arena():
     proofs = db.recent_proofs(12)
     st.markdown(ui.section("Proof wall", "Latest receipts from the crew", "Proof"), unsafe_allow_html=True)
     if proofs:
-        st.markdown(ui.proof_wall(proofs, db.photo_path), unsafe_allow_html=True)
+        st.markdown(ui.proof_wall(proofs, db.photo_bytes), unsafe_allow_html=True)
     else:
         st.markdown(ui.empty("📸", "No proofs yet. First photo sets the tone."), unsafe_allow_html=True)
 
@@ -181,7 +181,7 @@ def leaderboard():
                     unsafe_allow_html=True,
                 )
                 if p["thumb"]:
-                    right.image(str(db.photo_path(p["thumb"])), width="stretch")
+                    right.image(db.photo_bytes(p["thumb"]), width="stretch")
 
 
 def need_login():
@@ -224,7 +224,7 @@ def task_card(t, checkin):
         st.write("")
         if checkin:
             st.markdown(
-                f'<div class="proof"><img src="{ui.img_src(db.photo_path(checkin["thumb"]))}"/>'
+                f'<div class="proof"><img src="{ui.img_src(checkin["thumb"], db.photo_bytes)}"/>'
                 f'<span class="stamp pill dark">✓ {checkin["created_at"][11:16]}</span></div>',
                 unsafe_allow_html=True,
             )
@@ -369,6 +369,11 @@ def page_crew():
             for u in users
         )
         st.markdown(f"<div style='display:flex;flex-wrap:wrap'>{chips}</div>", unsafe_allow_html=True)
+    st.write("")
+    if db.IS_PG:
+        st.caption("🟢 Storage: cloud database. Data survives restarts and redeploys.")
+    else:
+        st.caption("🟠 Storage: local SQLite. On Streamlit Cloud this is wiped on restart. Set DATABASE_URL in Secrets.")
 
 
 # --------------------------------------------------------------------------- #

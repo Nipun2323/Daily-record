@@ -4,7 +4,6 @@ from __future__ import annotations
 import base64
 import html
 from functools import lru_cache
-from pathlib import Path
 
 CSS = """
 <style>
@@ -184,15 +183,11 @@ def esc(s) -> str:
     return html.escape(str(s or ""))
 
 
-@lru_cache(maxsize=512)
-def _b64(path: str, mtime: float) -> str:
-    return base64.b64encode(Path(path).read_bytes()).decode()
-
-
-def img_src(path: Path) -> str:
-    if not path.exists():
-        return ""
-    return f"data:image/jpeg;base64,{_b64(str(path), path.stat().st_mtime)}"
+@lru_cache(maxsize=256)
+def img_src(name: str, loader) -> str:
+    """Base64 data URI for a stored photo (names are immutable, so cache)."""
+    data = loader(name) if name else b""
+    return f"data:image/jpeg;base64,{base64.b64encode(data).decode()}" if data else ""
 
 
 def avatar(emoji: str, color: str, size: str = "") -> str:
@@ -239,10 +234,10 @@ def leaderboard_row(rank: int, user, st_: dict, week: list) -> str:
 </div>"""
 
 
-def proof_wall(rows, photo_path) -> str:
+def proof_wall(rows, loader) -> str:
     cards = []
     for r in rows:
-        src = img_src(photo_path(r["thumb"]))
+        src = img_src(r["thumb"], loader)
         cards.append(f"""
 <div class="shot"><div class="img"><img src="{src}" alt="proof"/>
   <div class="ov">{esc(r['task_emoji'])} {esc(r['title'])}</div></div>

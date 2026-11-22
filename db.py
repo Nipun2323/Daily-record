@@ -1,7 +1,12 @@
-"""Data layer for Daily Record: SQLite + photos on disk.
+"""Data layer for Daily Record.
 
-Everything that touches storage lives here, so swapping to a hosted
-database / object store later only means rewriting this module.
+Two backends, same code:
+  * Postgres (e.g. Supabase) when DATABASE_URL is set in env or st.secrets.
+    Use this for a shared deployment: data survives restarts and redeploys.
+  * SQLite in ./data otherwise, for local development.
+
+Photos are stored in the database itself (as JPEG bytes), so a deployment
+needs exactly one external service.
 """
 from __future__ import annotations
 
@@ -11,14 +16,16 @@ import io
 import os
 import secrets
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageOps
 
-try:  # iPhone photos (HEIC) — optional dependency
+try:  # iPhone photos (HEIC), optional dependency
     from pillow_heif import register_heif_opener
 
     register_heif_opener()
@@ -27,25 +34,31 @@ except ImportError:
 
 ROOT = Path(__file__).parent
 DATA_DIR = Path(os.environ.get("DAILY_RECORD_DATA", ROOT / "data"))
-PHOTO_DIR = DATA_DIR / "photos"
-DB_PATH = DATA_DIR / "daily_record.db"
+SQLITE_PATH = DATA_DIR / "daily_record.db"
 
 PINCH_COOLDOWN_MIN = 5
-MAX_PHOTO_PX = 1600
+MAX_PHOTO_PX = 1280
 THUMB_PX = 420
 
 
-def _tz() -> ZoneInfo:
-    name = os.environ.get("APP_TIMEZONE")
-    if not name:
-        try:
-            import streamlit as st
-
-            name = st.secrets.get("APP_TIMEZONE")
-        except Exception:
-            name = None
+def _setting(name: str) -> str | None:
+    if os.environ.get(name):
+        return os.environ[name]
     try:
-        return ZoneInfo(name or "UTC")
+        import streamlit as st
+
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+DATABASE_URL = _setting("DATABASE_URL")
+IS_PG = bool(DATABASE_URL)
+
+
+def _tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(_setting("APP_TIMEZONE") or "UTC")
     except Exception:
         return ZoneInfo("UTC")
 
@@ -59,76 +72,137 @@ def today() -> dt.date:
 
 
 # --------------------------------------------------------------------------- #
-# Connection / schema
+# Connection
 # --------------------------------------------------------------------------- #
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _pg_pool():
+    global _pool
+    with _pool_lock:
+        if _pool is None:
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
+
+            _pool = ConnectionPool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=6,
+                # prepare_threshold=None keeps it compatible with PgBouncer poolers.
+                kwargs={"row_factory": dict_row, "prepare_threshold": None},
+                check=ConnectionPool.check_connection,
+                open=True,
+            )
+            import atexit
+
+            atexit.register(_pool.close)
+        return _pool
+
+
+class _Conn:
+    """Minimal wrapper so the rest of the module writes '?' placeholders
+    and gets dict-style rows on both backends."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def execute(self, sql: str, params: tuple = ()):
+        if IS_PG:
+            sql = sql.replace("?", "%s")
+        return self.raw.execute(sql, params)
+
+
 @contextmanager
 def conn():
+    if IS_PG:
+        with _pg_pool().connection() as raw:  # commits on success, rolls back on error
+            yield _Conn(raw)
+        return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB_PATH, timeout=15)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys = ON")
+    raw = sqlite3.connect(SQLITE_PATH, timeout=15)
+    raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA foreign_keys = ON")
     try:
-        yield c
-        c.commit()
+        yield _Conn(raw)
+        raw.commit()
     finally:
-        c.close()
+        raw.close()
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    emoji       TEXT NOT NULL DEFAULT '🔥',
-    color       TEXT NOT NULL DEFAULT '#ff6b1a',
-    pin_salt    TEXT NOT NULL,
-    pin_hash    TEXT NOT NULL,
-    created_at  TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-    token       TEXT PRIMARY KEY,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at  TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tasks (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title        TEXT NOT NULL,
-    emoji        TEXT NOT NULL DEFAULT '✦',
-    created_on   TEXT NOT NULL,   -- first day the task counts (YYYY-MM-DD)
-    archived_on  TEXT             -- first day it no longer counts
-);
-CREATE TABLE IF NOT EXISTS checkins (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    day         TEXT NOT NULL,
-    photo       TEXT NOT NULL,
-    thumb       TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    UNIQUE(task_id, day)
-);
-CREATE TABLE IF NOT EXISTS pinches (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_user     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    to_user       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    task_id       INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
-    message       TEXT,
-    status        TEXT NOT NULL DEFAULT 'pending',  -- pending | answered | dismissed
-    photo         TEXT,
-    thumb         TEXT,
-    created_at    TEXT NOT NULL,
-    responded_at  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_checkins_user_day ON checkins(user_id, day);
-CREATE INDEX IF NOT EXISTS idx_pinches_to ON pinches(to_user, status);
-"""
+def _is_unique_violation(e: Exception) -> bool:
+    return isinstance(e, sqlite3.IntegrityError) or type(e).__name__ in {"UniqueViolation", "IntegrityError"}
+
+
+# --------------------------------------------------------------------------- #
+# Schema
+# --------------------------------------------------------------------------- #
+def _schema() -> list[str]:
+    pk = "SERIAL PRIMARY KEY" if IS_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    blob = "BYTEA" if IS_PG else "BLOB"
+    return [
+        f"""CREATE TABLE IF NOT EXISTS users (
+            id          {pk},
+            name        TEXT NOT NULL,
+            emoji       TEXT NOT NULL DEFAULT '🔥',
+            color       TEXT NOT NULL DEFAULT '#ff6b1a',
+            pin_salt    TEXT NOT NULL,
+            pin_hash    TEXT NOT NULL,
+            created_at  TEXT NOT NULL)""",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users (lower(name))",
+        """CREATE TABLE IF NOT EXISTS sessions (
+            token       TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at  TEXT NOT NULL)""",
+        f"""CREATE TABLE IF NOT EXISTS tasks (
+            id           {pk},
+            user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title        TEXT NOT NULL,
+            emoji        TEXT NOT NULL DEFAULT '✦',
+            created_on   TEXT NOT NULL,
+            archived_on  TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS checkins (
+            id          {pk},
+            task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            day         TEXT NOT NULL,
+            photo       TEXT NOT NULL,
+            thumb       TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE(task_id, day))""",
+        f"""CREATE TABLE IF NOT EXISTS pinches (
+            id            {pk},
+            from_user     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            to_user       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            task_id       INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+            message       TEXT,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            photo         TEXT,
+            thumb         TEXT,
+            created_at    TEXT NOT NULL,
+            responded_at  TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS photos (
+            name        TEXT PRIMARY KEY,
+            data        {blob} NOT NULL,
+            created_at  TEXT NOT NULL)""",
+        "CREATE INDEX IF NOT EXISTS idx_checkins_user_day ON checkins(user_id, day)",
+        "CREATE INDEX IF NOT EXISTS idx_pinches_to ON pinches(to_user, status)",
+    ]
+
+
+_initialised = False
 
 
 def init_db() -> None:
-    PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+    global _initialised
+    if _initialised:
+        return
     with conn() as c:
-        c.execute("PRAGMA journal_mode = WAL")
-        c.executescript(SCHEMA)
+        if not IS_PG:
+            c.execute("PRAGMA journal_mode = WAL")
+        for stmt in _schema():
+            c.execute(stmt)
+    _initialised = True
 
 
 # --------------------------------------------------------------------------- #
@@ -145,24 +219,26 @@ def create_user(name: str, pin: str, emoji: str, color: str) -> int:
     if not (pin.isdigit() and 4 <= len(pin) <= 8):
         raise ValueError("PIN must be 4–8 digits.")
     salt = secrets.token_hex(8)
-    with conn() as c:
-        try:
-            cur = c.execute(
+    try:
+        with conn() as c:
+            row = c.execute(
                 "INSERT INTO users(name, emoji, color, pin_salt, pin_hash, created_at)"
-                " VALUES (?,?,?,?,?,?)",
+                " VALUES (?,?,?,?,?,?) RETURNING id",
                 (name, emoji, color, salt, _hash_pin(pin, salt), now().isoformat()),
-            )
-        except sqlite3.IntegrityError:
-            raise ValueError(f"“{name}” is taken. Pick another name.")
-        return cur.lastrowid
+            ).fetchone()
+    except Exception as e:
+        if _is_unique_violation(e):
+            raise ValueError(f"“{name}” is taken. Pick another name.") from None
+        raise
+    return row["id"]
 
 
-def list_users() -> list[sqlite3.Row]:
+def list_users() -> list:
     with conn() as c:
         return c.execute("SELECT * FROM users ORDER BY created_at").fetchall()
 
 
-def get_user(user_id: int) -> sqlite3.Row | None:
+def get_user(user_id: int):
     with conn() as c:
         return c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
 
@@ -213,7 +289,7 @@ def add_task(user_id: int, title: str, emoji: str = "✦") -> None:
 def archive_task(task_id: int, user_id: int) -> None:
     """Stop a task counting from tomorrow on (today's proof still stands).
 
-    A task created today is deleted outright, since it has no history.
+    A task created today with no proof is deleted outright.
     """
     t = today()
     with conn() as c:
@@ -232,7 +308,7 @@ def archive_task(task_id: int, user_id: int) -> None:
             c.execute("UPDATE tasks SET archived_on=? WHERE id=?", (cutoff.isoformat(), task_id))
 
 
-def tasks_on(user_id: int, day: dt.date | None = None) -> list[sqlite3.Row]:
+def tasks_on(user_id: int, day: dt.date | None = None) -> list:
     d = (day or today()).isoformat()
     with conn() as c:
         return c.execute(
@@ -242,7 +318,7 @@ def tasks_on(user_id: int, day: dt.date | None = None) -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def active_tasks(user_id: int) -> list[sqlite3.Row]:
+def active_tasks(user_id: int) -> list:
     """Tasks not yet removed (what the Tasks page manages)."""
     with conn() as c:
         return c.execute(
@@ -251,36 +327,60 @@ def active_tasks(user_id: int) -> list[sqlite3.Row]:
 
 
 # --------------------------------------------------------------------------- #
-# Photos & check-ins
+# Photos
 # --------------------------------------------------------------------------- #
+def _encode(img: Image.Image, quality: int) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
 def _save_photo(data: bytes, prefix: str) -> tuple[str, str]:
-    """Normalise orientation, downscale, and write full + thumbnail JPEGs."""
+    """Normalise orientation, downscale, store full + thumbnail JPEGs."""
     try:
         img = Image.open(io.BytesIO(data))
         img = ImageOps.exif_transpose(img).convert("RGB")
     except Exception as e:
         raise ValueError("That file isn't a readable image.") from e
-    PHOTO_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"{prefix}_{uuid.uuid4().hex[:12]}"
-    full, thumb = f"{stem}.jpg", f"{stem}_t.jpg"
     big = img.copy()
     big.thumbnail((MAX_PHOTO_PX, MAX_PHOTO_PX))
-    big.save(PHOTO_DIR / full, "JPEG", quality=86, optimize=True)
-    ImageOps.fit(img, (THUMB_PX, THUMB_PX)).save(PHOTO_DIR / thumb, "JPEG", quality=80)
+    stem = f"{prefix}_{uuid.uuid4().hex[:12]}"
+    full, thumb = f"{stem}.jpg", f"{stem}_t.jpg"
+    with conn() as c:
+        for name, blob in ((full, _encode(big, 82)), (thumb, _encode(ImageOps.fit(img, (THUMB_PX, THUMB_PX)), 78))):
+            c.execute(
+                "INSERT INTO photos(name, data, created_at) VALUES (?,?,?)",
+                (name, blob, now().isoformat()),
+            )
     return full, thumb
 
 
-def photo_path(name: str) -> Path:
-    return PHOTO_DIR / name
+@lru_cache(maxsize=256)
+def photo_bytes(name: str) -> bytes:
+    """Photo names are unique and never rewritten, so caching is safe."""
+    with conn() as c:
+        row = c.execute("SELECT data FROM photos WHERE name=?", (name,)).fetchone()
+    return bytes(row["data"]) if row else b""
 
 
+def _delete_photos(c, *names: str) -> None:
+    for n in names:
+        if n:
+            c.execute("DELETE FROM photos WHERE name=?", (n,))
+
+
+# --------------------------------------------------------------------------- #
+# Check-ins
+# --------------------------------------------------------------------------- #
 def check_in(user_id: int, task_id: int, image: bytes) -> None:
     d = today().isoformat()
-    valid = {t["id"] for t in tasks_on(user_id)}
-    if task_id not in valid:
+    if task_id not in {t["id"] for t in tasks_on(user_id)}:
         raise ValueError("That task isn't on today's list.")
     full, thumb = _save_photo(image, f"u{user_id}_t{task_id}")
     with conn() as c:
+        old = c.execute(
+            "SELECT photo, thumb FROM checkins WHERE task_id=? AND day=?", (task_id, d)
+        ).fetchone()
         c.execute(
             "INSERT INTO checkins(task_id, user_id, day, photo, thumb, created_at)"
             " VALUES (?,?,?,?,?,?)"
@@ -288,9 +388,11 @@ def check_in(user_id: int, task_id: int, image: bytes) -> None:
             " thumb=excluded.thumb, created_at=excluded.created_at",
             (task_id, user_id, d, full, thumb, now().isoformat()),
         )
+        if old:  # retake: drop the replaced images
+            _delete_photos(c, old["photo"], old["thumb"])
 
 
-def checkins_on(user_id: int, day: dt.date | None = None) -> dict[int, sqlite3.Row]:
+def checkins_on(user_id: int, day: dt.date | None = None) -> dict:
     d = (day or today()).isoformat()
     with conn() as c:
         rows = c.execute(
@@ -299,7 +401,7 @@ def checkins_on(user_id: int, day: dt.date | None = None) -> dict[int, sqlite3.R
     return {r["task_id"]: r for r in rows}
 
 
-def recent_proofs(limit: int = 12) -> list[sqlite3.Row]:
+def recent_proofs(limit: int = 12) -> list:
     with conn() as c:
         return c.execute(
             "SELECT ch.*, t.title, t.emoji AS task_emoji, u.name, u.emoji, u.color"
@@ -318,16 +420,16 @@ def _history(user_id: int):
             "SELECT id, created_on, archived_on FROM tasks WHERE user_id=?", (user_id,)
         ).fetchall()
         done = c.execute("SELECT task_id, day FROM checkins WHERE user_id=?", (user_id,)).fetchall()
-    done_set = {(r["task_id"], r["day"]) for r in done}
-    return tasks, done_set
+    return tasks, {(r["task_id"], r["day"]) for r in done}
+
+
+def _active_ids(tasks, d: str) -> list[int]:
+    return [t["id"] for t in tasks if t["created_on"] <= d and (t["archived_on"] is None or t["archived_on"] > d)]
 
 
 def _day_complete(tasks, done_set, day: dt.date) -> bool:
     d = day.isoformat()
-    active = [
-        t["id"] for t in tasks
-        if t["created_on"] <= d and (t["archived_on"] is None or t["archived_on"] > d)
-    ]
+    active = _active_ids(tasks, d)
     return bool(active) and all((tid, d) in done_set for tid in active)
 
 
@@ -339,10 +441,7 @@ def stats(user_id: int) -> dict:
     """
     tasks, done_set = _history(user_id)
     t = today()
-    todays = [
-        x["id"] for x in tasks
-        if x["created_on"] <= t.isoformat() and (x["archived_on"] is None or x["archived_on"] > t.isoformat())
-    ]
+    todays = _active_ids(tasks, t.isoformat())
     done_today = sum((tid, t.isoformat()) in done_set for tid in todays)
     if not tasks:
         return {"current": 0, "best": 0, "done": 0, "total": 0, "complete_days": 0}
@@ -367,24 +466,16 @@ def stats(user_id: int) -> dict:
         current += 1
         idx -= 1
 
-    return {
-        "current": current,
-        "best": best,
-        "done": done_today,
-        "total": len(todays),
-        "complete_days": sum(complete),
-    }
+    return {"current": current, "best": best, "done": done_today, "total": len(todays), "complete_days": sum(complete)}
 
 
-def last_7(user_id: int) -> list[bool | None]:
+def last_7(user_id: int) -> list:
     """Completion for the last 7 days (oldest first). None = no tasks that day."""
     tasks, done_set = _history(user_id)
     out = []
     for i in range(6, -1, -1):
         d = today() - dt.timedelta(days=i)
-        ds = d.isoformat()
-        has = any(x["created_on"] <= ds and (x["archived_on"] is None or x["archived_on"] > ds) for x in tasks)
-        out.append(_day_complete(tasks, done_set, d) if has else None)
+        out.append(_day_complete(tasks, done_set, d) if _active_ids(tasks, d.isoformat()) else None)
     return out
 
 
@@ -403,13 +494,12 @@ def pinch(from_user: int, to_user: int, task_id: int | None, message: str) -> No
         if recent:
             raise ValueError(f"Easy. One pinch per person every {PINCH_COOLDOWN_MIN} minutes.")
         c.execute(
-            "INSERT INTO pinches(from_user, to_user, task_id, message, created_at)"
-            " VALUES (?,?,?,?,?)",
+            "INSERT INTO pinches(from_user, to_user, task_id, message, created_at) VALUES (?,?,?,?,?)",
             (from_user, to_user, task_id, (message or "").strip()[:140], now().isoformat()),
         )
 
 
-def incoming_pinches(user_id: int) -> list[sqlite3.Row]:
+def incoming_pinches(user_id: int) -> list:
     with conn() as c:
         return c.execute(
             "SELECT p.*, u.name AS from_name, u.emoji AS from_emoji, u.color AS from_color,"
@@ -421,7 +511,7 @@ def incoming_pinches(user_id: int) -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def sent_pinches(user_id: int, limit: int = 6) -> list[sqlite3.Row]:
+def sent_pinches(user_id: int, limit: int = 6) -> list:
     with conn() as c:
         return c.execute(
             "SELECT p.*, u.name AS to_name, u.emoji AS to_emoji, u.color AS to_color,"
@@ -437,9 +527,7 @@ def answer_pinch(pinch_id: int, user_id: int, image: bytes) -> None:
     """Reply to a pinch with a live photo. If the pinch named a task that
     isn't done yet today, the photo also checks it off."""
     with conn() as c:
-        p = c.execute(
-            "SELECT * FROM pinches WHERE id=? AND to_user=?", (pinch_id, user_id)
-        ).fetchone()
+        p = c.execute("SELECT * FROM pinches WHERE id=? AND to_user=?", (pinch_id, user_id)).fetchone()
     if not p:
         raise ValueError("Pinch not found.")
     full, thumb = _save_photo(image, f"pinch{pinch_id}")

@@ -18,17 +18,40 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy on Streamlit Community Cloud
+## Deploy for you and your friends (free)
 
-1. Push this repo to GitHub.
-2. On share.streamlit.io, create an app pointing to `app.py`.
-3. Optional: in the app's **Secrets**, set your timezone so "today" rolls over at your midnight:
+Two free services: **Supabase** holds the data (users, streaks, photos), **Streamlit Community Cloud** runs the app. Without Supabase, Streamlit Cloud wipes everything whenever the app restarts.
+
+### 1. Create the database (Supabase)
+1. Sign up at supabase.com → **New project**. Pick a region near you and **save the database password**.
+2. When the project is ready, click **Connect** (top of the dashboard).
+3. Under connection string, choose **Session pooler** and copy the URI. It looks like:
+   `postgresql://postgres.abcdefgh:[YOUR-PASSWORD]@aws-0-ap-south-1.pooler.supabase.com:5432/postgres`
+4. Replace `[YOUR-PASSWORD]` with your password.
+
+Use the **Session pooler**, not "Direct connection": on the free plan the direct connection is IPv6-only, and Streamlit Cloud can't reach it. The app creates its tables on first run, so you don't need to set anything up in Supabase.
+
+### 2. Deploy the app (Streamlit Community Cloud)
+1. Merge this branch into `main` (or deploy straight from this branch).
+2. Go to share.streamlit.io, sign in with GitHub, click **Create app** and pick this repo, the branch, and `app.py`.
+3. Open **Advanced settings → Secrets** and paste:
    ```toml
-   APP_TIMEZONE = "Asia/Kolkata"
+   DATABASE_URL = "postgresql://postgres.abcdefgh:YOURPASSWORD@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
+   APP_TIMEZONE = "Asia/Kolkata"   # your timezone; "today" resets at this midnight
    ```
-   Defaults to UTC.
+4. Deploy. On the **Crew** page you should see "🟢 Storage: cloud database". If it says 🟠, the secret isn't set.
 
-> **Storage warning.** Data lives in SQLite at `data/` and photos on disk. Streamlit Community Cloud's disk is **not persistent**: a reboot or redeploy wipes users, streaks, and photos. Fine for trying it out; for real use, move storage to a hosted DB + bucket (e.g. Supabase). All storage code is isolated in `db.py`, so that's the only file to change.
+### 3. Use it together
+- Send your friend the app URL. Each of you creates a profile on **Crew** with your own PIN.
+- Signing in puts a session token in the URL. Bookmark that link (or add it to your home screen) to stay signed in on that device.
+- The **Arena** home page shows both streaks live. Hit 🤏 Pinch on your friend's row to make them send a live photo.
+
+### Good to know
+- **Streamlit Cloud apps sleep** after a period with no visitors. The first visit then shows a "wake up" button and takes ~30 s. Your data is safe in Supabase.
+- **Supabase free projects pause** after about a week with no activity. Using the app daily keeps it awake; if it does pause, click Restore in the Supabase dashboard.
+- **Who can see it:** Streamlit Cloud apps are public by default, so anyone with the link can see the leaderboard and proof wall. To restrict it, use the app's **Settings → Sharing** on Streamlit Cloud.
+- **Space:** photos are compressed (~150 KB full, ~25 KB thumbnail). Supabase's free 500 MB fits a few thousand check-ins.
+- If a password contains special characters (`@`, `#`, `/`, `:`), URL-encode them in `DATABASE_URL` (e.g. `@` → `%40`), or reset it to letters and numbers.
 
 ## How streaks work
 
@@ -39,9 +62,10 @@ A day counts when **every** task active that day has a photo. Your streak is the
 | File | What it does |
 |---|---|
 | `app.py` | Pages, navigation, dialogs, live fragments |
-| `db.py` | SQLite schema, users/PINs, tasks, check-ins, streaks, pinches, image processing |
+| `db.py` | Storage (Postgres if `DATABASE_URL` is set, else local SQLite), users/PINs, tasks, check-ins, streaks, pinches, photos |
 | `styles.py` | All CSS and HTML card builders |
 | `.streamlit/config.toml` | Dark theme, 25 MB upload limit |
+| `.streamlit/secrets.toml.example` | Template for the secrets above |
 
 ## Limits worth knowing
 
