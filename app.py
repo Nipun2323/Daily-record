@@ -11,7 +11,25 @@ import styles as ui
 
 st.set_page_config(page_title="Daily Record", page_icon="✺", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(ui.CSS, unsafe_allow_html=True)
-db.init_db()
+try:
+    db.init_db()
+except db.DatabaseConnectionError as e:
+    st.markdown(ui.empty("🔌", "Can't reach the database"), unsafe_allow_html=True)
+    st.error(f"**What Postgres said:** {e.reason}")
+    for h in e.hints:
+        st.warning(h)
+    st.markdown(
+        "**Checklist**\n"
+        "1. Supabase → your project → **Connect** → **Session pooler** → copy the URI "
+        "(host ends in `pooler.supabase.com`, port `5432`, user `postgres.<project-ref>`).\n"
+        "2. Replace `[YOUR-PASSWORD]` (brackets too) with the database password. Forgot it? "
+        "Project Settings → Database → Reset database password. Use letters and numbers only.\n"
+        "3. Streamlit Cloud → your app → ⋮ → **Settings → Secrets**, paste "
+        '`DATABASE_URL = "…"` (keep the quotes) and save.\n'
+        "4. If the Supabase project shows **Paused**, click Restore.\n"
+        "5. Then ⋮ → **Reboot app**."
+    )
+    st.stop()
 
 EMOJIS = ["🔥", "⚡", "🦊", "🐺", "🦁", "🐼", "🐸", "🦄", "👾", "🤖", "🌙", "🌊", "🍀", "💎", "🚀", "🎯"]
 COLORS = {"Ember": "#ff6b1a", "Violet": "#7b5cff", "Rose": "#ff4fa3", "Cyan": "#46e0ff", "Lime": "#c8ff4d", "Gold": "#ffc94d"}

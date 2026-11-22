@@ -78,19 +78,71 @@ _pool = None
 _pool_lock = threading.Lock()
 
 
+class DatabaseConnectionError(RuntimeError):
+    """Raised with a human-readable diagnosis when Postgres is unreachable."""
+
+    def __init__(self, reason: str, hints: list[str]):
+        super().__init__(reason)
+        self.reason = reason
+        self.hints = hints
+
+
+def _redact(text: str) -> str:
+    from urllib.parse import urlsplit
+
+    try:
+        pw = urlsplit(DATABASE_URL).password
+    except Exception:
+        pw = None
+    return text.replace(pw, "•••") if pw else text
+
+
+def diagnose_url(url: str) -> list[str]:
+    """Spot the common Supabase connection-string mistakes without connecting."""
+
+    url = url.strip()
+    hints = []
+    if not url.startswith(("postgresql://", "postgres://")):
+        hints.append("DATABASE_URL must start with postgresql://")
+    if "[" in url or "]" in url or "YOUR-PASSWORD" in url.upper():
+        hints.append("The placeholder is still in the URL. Replace [YOUR-PASSWORD] (including the brackets) with your real database password.")
+    if url.count("@") > 1:
+        hints.append("The URL has more than one @, so your password probably contains @. Encode it as %40 or reset the password to letters and numbers.")
+    # Parse by hand so a malformed password doesn't hide the other checks.
+    rest = url.split("://", 1)[-1]
+    user = rest.split(":", 1)[0].split("@", 1)[0]
+    hostport = rest.rsplit("@", 1)[-1].split("/", 1)[0]
+    host, _, port = hostport.partition(":")
+    if host.startswith("db.") and host.endswith(".supabase.co"):
+        hints.append("This is the Direct connection host (db.….supabase.co), which is IPv6-only on the free plan and unreachable from Streamlit Cloud. In Supabase click Connect → Session pooler and use that URL (host ends in pooler.supabase.com).")
+    if host.endswith("pooler.supabase.com") and user == "postgres":
+        hints.append("Pooler URLs need the user as postgres.<project-ref>, not just postgres. Copy the Session pooler string exactly as Supabase shows it.")
+    if port and port not in ("5432", "6543"):
+        hints.append(f"Unexpected port {port}. Supabase's Session pooler uses 5432.")
+    return hints
+
+
 def _pg_pool():
     global _pool
     with _pool_lock:
         if _pool is None:
+            import psycopg
             from psycopg.rows import dict_row
             from psycopg_pool import ConnectionPool
+
+            # One direct attempt first: the pool retries silently and only
+            # reports "PoolTimeout", which hides the real reason.
+            try:
+                psycopg.connect(DATABASE_URL, connect_timeout=10, prepare_threshold=None).close()
+            except Exception as e:
+                raise DatabaseConnectionError(_redact(str(e)).strip() or type(e).__name__, diagnose_url(DATABASE_URL)) from None
 
             _pool = ConnectionPool(
                 DATABASE_URL,
                 min_size=1,
                 max_size=6,
                 # prepare_threshold=None keeps it compatible with PgBouncer poolers.
-                kwargs={"row_factory": dict_row, "prepare_threshold": None},
+                kwargs={"row_factory": dict_row, "prepare_threshold": None, "connect_timeout": 10},
                 check=ConnectionPool.check_connection,
                 open=True,
             )
